@@ -1,0 +1,164 @@
+# =============================================================================
+# SEAMLESS — Python / PyTorch ML project .gitignore
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+venv/
+env/
+.venv/
+.env/
+.conda/
+ENV/
+
+# ---------------------------------------------------------------------------
+# Python cache & compiled files
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ---------------------------------------------------------------------------
+# Distribution / packaging
+# ---------------------------------------------------------------------------
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+MANIFEST
+pip-wheel-metadata/
+
+# ---------------------------------------------------------------------------
+# Testing & coverage
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# ---------------------------------------------------------------------------
+# IDE / editor settings
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------------------
+# OS-generated files
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------------------
+# Large data files & datasets
+# ---------------------------------------------------------------------------
+*.csv
+*.tsv
+data/
+datasets/
+raw_data/
+test_data/
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.zarr
+*.tif
+*.tiff
+*.ome.tif
+*.czi
+*.lif
+*.mat
+*.ilp
+# Exclude gut data subdirectory
+examples/data/gut/
+# Re-include the small bundled sample dataset (must come after *.h5 exclusion)
+!examples/data/synthetic/ellipsoid.h5
+!examples/data/synthetic/ellipsoid_projection.h5
+
+# ---------------------------------------------------------------------------
+# PyTorch model weights & checkpoints
+# ---------------------------------------------------------------------------
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+checkpoints/
+models/
+weights/
+
+# ---------------------------------------------------------------------------
+# Generated plots, outputs, results
+# ---------------------------------------------------------------------------
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+*.eps
+*.mp4
+*.avi
+*.gif
+outputs/
+results/
+figures/
+plots/
+
+# ---------------------------------------------------------------------------
+# Jupyter notebooks & checkpoints
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+# Allow example notebooks before excluding all other notebooks
+!examples/*.ipynb
+*.ipynb
+
+# ---------------------------------------------------------------------------
+# Environment / secrets
+# ---------------------------------------------------------------------------
+.env
+*.env
+secrets.yaml
+secrets.json
+
+# ---------------------------------------------------------------------------
+# Profiling & logs
+# ---------------------------------------------------------------------------
+*.log
+logs/
+runs/
+wandb/
+mlruns/
+lightning_logs/
+*.prof
+
+# ---------------------------------------------------------------------------
+# Local development & analysis (not pushed to GitHub)
+# ---------------------------------------------------------------------------
+analysis/
+scripts/
+docs/
+.claude/
+deprecated/
+notebooks/
+# Note: examples/ is selectively included above (notebooks + synthetic data)
