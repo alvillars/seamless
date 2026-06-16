@@ -96,6 +96,8 @@ examples/data/gut/
 # Re-include the small bundled sample dataset (must come after *.h5 exclusion)
 !examples/data/synthetic/ellipsoid.h5
 !examples/data/synthetic/ellipsoid_projection.h5
+# Track repo assets (figures for README)
+!assets/
 
 # ---------------------------------------------------------------------------
 # PyTorch model weights & checkpoints

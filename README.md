@@ -1,11 +1,14 @@
 # SEAMLESS — Mesh-Free Neural Kinematics
 
-**SEAMLESS** is a Python package for mesh-free tissue cartography and computational morphogenesis. It replaces classical mesh-based pipelines (e.g. TubULAR, ImSAnE) with an end-to-end deep learning approach using continuous mathematical representations — Physics-Informed Neural Networks and Neural Scene Flow.
+**SEAMLESS** is a Python package for analyzing shape dynamics and tissue flow in 3D microscopy data. It replaces classical mesh-based pipelines (TubULAR, ImSAnE) with an end-to-end deep learning approach — continuous neural representations instead of triangulated meshes, exact autograd kinematics instead of Discrete Exterior Calculus.
 
-SEAMLESS is in an active research state. Nothing should be assumed to work correctly for now.
+> Active research software. APIs may change.
+
 ---
 
 ## Why SEAMLESS?
+
+![Synthetic data pipeline](assets/synthetic_pipeline.png)
 
 | Classical Tools | SEAMLESS |
 |---|---|
@@ -16,159 +19,131 @@ SEAMLESS is in an active research state. Nothing should be assumed to work corre
 
 ---
 
-## Project Structure
+## Installation
 
-### Core Package (Installable via `pip install -e .`)
-
-```
-seamless/                     # Main package directory
-├── seamless/                 # Python package
-│   ├── core/                # Kinematics computation
-│   ├── flow/                # Neural scene/optical flow
-│   ├── cartography/         # Surface parameterization (Nuvo)
-│   ├── networks/            # Mapping network architectures
-│   ├── optim/               # Training optimization
-│   ├── synth/               # Synthetic data generation
-│   ├── utils/               # I/O and data utilities
-│   └── vis/                 # Visualization (napari, matplotlib, plotly)
-├── tests/                    # Unit tests
-├── pyproject.toml           # Package configuration
-├── LICENSE                  # MIT License
-└── CHANGELOG.md             # Release history
+```bash
+git clone https://github.com/alvillars/seamless.git
+cd seamless
+pip install -e .
 ```
 
-### Local Examples & Analysis (Not on GitHub)
+**Requirements:** Python ≥ 3.11, PyTorch ≥ 2.0, numpy, scipy, matplotlib, scikit-image, h5py, plotly.
 
+---
+
+## Quick Start
+
+### High-level pipeline (one call)
+
+```python
+from seamless import SeamlessPipeline
+
+pipe = SeamlessPipeline(
+    volumes,            # list of (Z, Y, X) numpy arrays
+    topology='cylinder',
+    method='3d_native',
+    threshold=43,
+)
+pipe.run(
+    projection_h5='outputs/projection.h5',
+    flow_h5='outputs/flow_results.h5',
+)
+# pipe.frames, pipe.flow_fields, pipe.kinematics are all populated
 ```
-examples/                     # Quick-start Jupyter notebooks
-├── 01_segmentation_to_mapping.ipynb    # Image+Segmentation → UV Mapping
-├── 02_flow_computation.ipynb           # Mapping → Flow (3 methods)
-├── 03_flow_decomposition.ipynb         # Flow → Kinematics
-└── data/
-    ├── synthetic/           # Synthetic test data
-    │   ├── ellipsoid.h5                # Waist constriction geometry
-    │   └── ellipsoid_projection.h5     # Pre-computed UV projection
-    └── gut/                 # Real tissue data
-        ├── fly_midgut_3D_t.tif                    # Image volume
-        └── fly_midgut_3D_t_tracked_sequence_corrected.h5  # Time series
+
+### Step-by-step API
+
+```python
+from seamless import Parameterizer, FlowEstimator, KinematicsAnalyzer
+from seamless.config import ThreeDNativeConfig
+
+# 1. Parameterize: 3D surface → UV map + max-projection
+param = Parameterizer.from_volume(volume, topology='cylinder', threshold=43)
+param.train()
+
+# 2. Estimate flow over a frame pair
+estimator = FlowEstimator.from_projection_h5(
+    'projection.h5',
+    source_file='volumes.h5',          # needed for 3d_native method
+    three_d_config=ThreeDNativeConfig(),
+)
+flow_fields = estimator.estimate('3d_native')   # or 'piv' / '2d_neural'
+
+# 3. Kinematics
+kin = KinematicsAnalyzer(estimator.frames, flow_fields)
+eulerian  = kin.compute_eulerian(flow_fields[0])   # divergence, curl, strain…
+lagrangian = kin.compute_lagrangian()              # cumulative strain over time
+```
+
+---
+
+## Example Notebooks
+
+Six notebooks in `examples/` cover the full pipeline with a bundled synthetic dataset (ellipsoid waist constriction, 2 timepoints):
+
+| Notebook | What it covers |
+|---|---|
+| `01_parameterization_workflow.ipynb` | 3D volume → NuVo UV map → max-projection |
+| `01_segmentation_to_mapping.ipynb` | Segmentation mask → point cloud → UV mapping |
+| `02_flow_comparison_piv_2d_3d.ipynb` | Compare PIV, 2D neural, and 3D native flow side-by-side |
+| `02_flow_computation.ipynb` | 3D native flow from start to kinematics dashboard |
+| `03_end_to_end_timeseries.ipynb` | Full `SeamlessPipeline` with HDF5 save/reload |
+| `03_flow_decomposition.ipynb` | Helmholtz-Hodge decomposition and Lagrangian strain |
+
+```bash
+pip install jupyter
+jupyter notebook examples/
 ```
 
 ---
 
 ## Pipeline Overview
 
-### Step 1 — Data Ingestion (`core/`)
-Convert 3D segmented TIF sequences into unoriented point clouds and compute parametric surface normals via UV grid gradients—mathematically robust and orientation-consistent.
+### Step 1 — Parameterization (`Parameterizer`)
+Trains a NuVo MLP that maps each surface point to a consistent 2D UV coordinate. Supports warm-starting across timepoints for temporal coherence.
 
-### Step 2 — Neural Parameterization (`cartography/`, `networks/mapping.py`)
-This step establishes a static 2D material frame (a UV map) for every point on the surface using multi-chart Nuvo networks. This allows us to map 3D surface kinematics onto a consistent, flattened 2D coordinate system, enabling standardized visualization and cartography across the entire developmental timeseries.
+### Step 2 — Projection (`ProjectedFrame`)
+Casts the 3D volume onto the learned UV grid via surface-normal sampling, producing a multi-layer intensity stack and a max-projection image.
 
-### Step 3 — Neural Scene Flow (`flow/networks.py`, `flow/train.py`)
-Unsupervised tracking of tissue motion from frame $t$ to $t+1$. A coordinate-MLP outputs 3D velocity vectors, optimized via 3D photometric consistency loss (trilinear intensity matching) and KNN-based Laplacian smoothness. Supports 3 approaches: optical flow (PIV), 2D neural flow (UV space), and 3D native scene flow.
+### Step 3 — Flow Estimation (`FlowEstimator`)
+Estimates the 3D velocity field between frame pairs. Three methods:
+- **PIV** — classical 2D optical flow lifted to 3D via the NuVo map
+- **2D neural** — MLP trained in UV space, lifted to 3D
+- **3D native** — MLP trained directly in voxel space via photometric consistency
 
-### Step 4 — Neural Kinematics (`core/kinematics.py`)
-Compute biological deformation metrics directly from the FlowMLP via `torch.autograd` Jacobian evaluation:
+![Flow decomposition and Lagrangian kinematics](assets/flow_decomposition.png)
 
-$$E_{\text{surface}} = P \cdot \frac{1}{2}(\nabla v + \nabla v^T) \cdot P, \quad P = I - \mathbf{n}\mathbf{n}^T$$
-
-Outputs: surface strain rate, divergence (areal expansion), and curl (vorticity).
-
-### Step 5 — Visualization (`vis/`)
-Integration with napari, matplotlib, and plotly for interactive visualization of flow fields, kinematics, and UV projections. Real-time validation and exploration of deformation dynamics.
+### Step 4 — Kinematics (`KinematicsAnalyzer`)
+Derives deformation metrics analytically from the flow MLP via `torch.autograd`:
+- **Eulerian:** divergence, curl, surface strain rate, normal/tangential velocity, vector Laplacian
+- **Lagrangian:** cumulative strain and particle pathlines
+- **HHD:** Helmholtz-Hodge decomposition into divergence-free, curl-free, and harmonic components
 
 ---
 
-## Installation
+## Project Structure
 
-```bash
-git clone https://github.com/your-org/seamless.git
-cd seamless
-pip install -e .
 ```
-
-**Requirements:** Python ≥ 3.11, PyTorch ≥ 2.0, scikit-image, scipy, numpy, matplotlib, plotly.
-
----
-
-## Quick Start: Example Notebooks
-
-Three Jupyter notebooks demonstrate the complete pipeline with sample data:
-
-### 1. **Segmentation → Point Cloud → Parameterization**
-   - **File:** `examples/01_segmentation_to_mapping.ipynb`
-   - **Input:** Segmented ellipsoid synthetic dataset
-   - **Output:** UV parameterization via NuVo network
-   - **Runtime:** ~10 minutes
-
-### 2. **Image Sequence → Flow Analysis (3 Methods)**
-   - **File:** `examples/02_flow_computation.ipynb`
-   - **Compares:**
-     - A1: Optical flow (PIV) — classical, fast, 2D-only
-     - A2: 2D neural flow (UV space) — parameterization-dependent
-     - A3: 3D scene flow — topology-flexible, most accurate
-   - **Output:** Flow vectors and comparative analysis
-   - **Runtime:** ~15 minutes
-
-### 3. **Flow → Kinematics Decomposition**
-   - **File:** `examples/03_flow_decomposition.ipynb`
-   - **Computes:**
-     - Helmholtz-Hodge decomposition (divergence-free, curl-free, harmonic)
-     - Local kinematics (divergence, curl, strain rate)
-     - Validation metrics (endpoint error, angular error)
-   - **Output:** Kinematics fields and analysis plots
-   - **Runtime:** ~5 minutes
-
-### Running the Examples
-
-```bash
-# Install Jupyter if needed
-pip install jupyter
-
-# Launch notebook server
-jupyter notebook examples/
-
-# Run notebooks in order: 01 → 02 → 03
-# Each notebook loads outputs from the previous one
+seamless/
+├── pipeline.py          # High-level API: Parameterizer, FlowEstimator,
+│                        #   KinematicsAnalyzer, SeamlessPipeline, ProjectedFrame
+├── config.py            # Dataclasses for all method configs
+├── cartography/         # NuVo network training and UV projection
+├── core/                # Geometry, kinematics math, validation
+├── flow/                # Flow networks and training (PIV, 2D, 3D)
+├── networks/            # Shared MLP architectures
+├── optim/               # Optimization helpers
+├── synth/               # Synthetic dataset generation
+├── utils/               # HDF5 I/O (loading.py, saving.py)
+└── vis/                 # Visualization (napari, matplotlib, plotly)
+examples/
+├── *.ipynb              # Six quick-start notebooks
+└── data/synthetic/      # Bundled sample dataset (2-frame, 256³)
+tests/                   # Unit and integration tests
 ```
 
 ---
 
-## API Overview
+## License
 
-### Core Kinematics
-```python
-from seamless.core import (
-    compute_derivatives,           # Jacobian & Hessian
-    compute_local_kinematics,      # Divergence, curl, vorticity
-    extract_harmonic_component,    # Helmholtz-Hodge decomposition
-    compute_error_metrics,         # Validation metrics
-)
-```
-
-### Flow Analysis (3 Methods)
-```python
-from seamless.flow import (
-    compute_piv,                   # A1: Optical flow
-    UVFlowMLP,                     # A2: 2D neural flow
-    SceneFlowMLP,                  # A3: 3D scene flow
-    train,                         # Universal training pipeline
-)
-```
-
-### Surface Parameterization
-```python
-from seamless.cartography import (
-    NuvoMLP,                       # Multi-chart parameterization
-    train_nuvo,                    # Training pipeline
-    project_surface,               # 3D → 2D projection
-)
-```
-
-### Visualization
-```python
-from seamless.vis import (
-    TimeSeriesViewer,              # napari viewer
-    load_h5,                        # HDF5 data loading
-    cached_colormap,               # Vector field coloring
-)
-```
+MIT — see [LICENSE](LICENSE).
