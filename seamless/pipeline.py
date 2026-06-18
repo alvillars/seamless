@@ -214,6 +214,76 @@ class Parameterizer:
             config=config,
         )
 
+    @classmethod
+    def from_segmentation(
+        cls,
+        segmentation: np.ndarray,
+        topology: str,
+        *,
+        label: Optional[int] = None,
+        num_target_points: int = 20_000,
+        num_charts: int = 1,
+        device: Optional[torch.device] = None,
+        config: Optional[ParameterizationConfig] = None,
+        seed: int = 42,
+    ) -> "Parameterizer":
+        """Build a Parameterizer from a pre-computed segmentation mask.
+
+        Use this instead of :meth:`from_volume` when a dedicated segmentation
+        (e.g. from ilastik, Cellpose, or manual annotation) is available — the
+        surface is extracted directly from the mask without thresholding.
+
+        Args:
+            segmentation: (Z, Y, X) binary or labeled segmentation array.
+                Binary (bool or 0/1 integer): all foreground voxels are used.
+                Labeled (multi-value integer): pass ``label`` to pick one
+                object, or leave None to pick the largest by voxel count
+                (background 0 excluded).
+            topology: Nuvo topology string ('cylinder', 'sphere', 'bent_sheet').
+            label: For labeled segmentations, the integer label to use. If None,
+                the label with the most voxels (excluding 0) is chosen.
+            num_target_points: Target surface-point count after subsampling.
+            num_charts, device, config, seed: forwarded to the constructor.
+        """
+        from skimage.measure import marching_cubes
+
+        seg = np.asarray(segmentation)
+        unique_labels, label_counts = np.unique(seg, return_counts=True)
+        is_binary = seg.dtype == bool or set(unique_labels).issubset({0, 1})
+
+        if is_binary:
+            binary = seg.astype(bool)
+        elif label is not None:
+            binary = seg == label
+        else:
+            fg_mask = unique_labels != 0
+            if not fg_mask.any():
+                raise ValueError("Segmentation contains no foreground labels.")
+            best_label = unique_labels[fg_mask][label_counts[fg_mask].argmax()]
+            binary = seg == best_label
+
+        if not binary.any():
+            raise ValueError(
+                "No foreground voxels found"
+                + (f" for label={label}." if label is not None else ".")
+            )
+
+        points, _, _, _ = marching_cubes(binary, level=0.5, step_size=1)
+
+        rng = np.random.default_rng(seed)
+        if len(points) > num_target_points:
+            idx = rng.choice(len(points), size=num_target_points, replace=False)
+            points = points[idx]
+
+        return cls(
+            points,
+            normals=None,
+            topology=topology,
+            num_charts=num_charts,
+            device=device,
+            config=config,
+        )
+
     # ------------------------------------------------------------------ #
     # Training & projection
     # ------------------------------------------------------------------ #
