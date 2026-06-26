@@ -20,6 +20,21 @@ def uv_grid(uv_res: int, device: torch.device) -> tuple[torch.Tensor, torch.Tens
     return flat, grid
 
 
+def uv_convex_hull_mask(uv_points: np.ndarray, uv_res: int) -> np.ndarray:
+    """Boolean (uv_res, uv_res) mask — True inside the Delaunay triangulation of uv_points.
+
+    Uses Delaunay rather than strict ConvexHull so that concave UV footprints
+    (e.g. a cylinder unrolled with a non-convex boundary) are handled correctly.
+    """
+    from scipy.spatial import Delaunay
+    tri = Delaunay(uv_points)
+    lin = np.linspace(0.0, 1.0, uv_res, dtype=np.float32)
+    uu, vv = np.meshgrid(lin, lin, indexing="xy")
+    grid_pts = np.stack([uu.ravel(), vv.ravel()], axis=1)
+    inside = tri.find_simplex(grid_pts) >= 0
+    return inside.reshape(uv_res, uv_res)
+
+
 def volume_to_tensor(
     vol: np.ndarray,
     joint_min: float,

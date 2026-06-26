@@ -345,6 +345,7 @@ class Parameterizer:
         mesh_to_vol_scale: Optional[np.ndarray] = None,
         backend: str = "batched",
         return_maps: bool = False,
+        use_hull_mask: bool = False,
     ):
         """Project ``volume`` onto the trained UV grid along surface normals.
 
@@ -357,6 +358,9 @@ class Parameterizer:
             mesh_to_vol_scale: (3,) normalized→voxel scaling (default [1, 1, 1]).
             backend: 'batched' (safe, logged) or 'optimized' (fast).
             return_maps: If True, also return the (uv_res, uv_res, 3) XYZ maps.
+            use_hull_mask: If True, pixels outside the Delaunay triangulation of the
+                training UV point cloud are set to NaN in every returned layer, avoiding
+                extrapolation artefacts at the border of the UV support.
 
         Returns:
             ``multilayer`` of shape (len(offsets), uv_res, uv_res); the max
@@ -367,6 +371,7 @@ class Parameterizer:
             raise RuntimeError("Model not trained yet. Call .train() first.")
 
         from seamless.cartography.projection import project_surface
+        from seamless.core.geometry import uv_convex_hull_mask
 
         if offsets is None:
             offsets = np.linspace(-5.0, 5.0, 6)
@@ -379,6 +384,12 @@ class Parameterizer:
         lin = np.linspace(0.0, 1.0, uv_res)
         uu, vv = np.meshgrid(lin, lin, indexing="xy")
         uv_flat = np.stack([uu.ravel(), vv.ravel()], axis=1).astype(np.float32)
+
+        hull_mask = None
+        if use_hull_mask:
+            if self.uv_map is None:
+                raise RuntimeError("uv_map not available. Call .train() first.")
+            hull_mask = uv_convex_hull_mask(self.uv_map, uv_res)
 
         norm_points = self.xyz.detach().cpu().numpy()             # normalized space
         points_voxel = self.points_voxel.detach().cpu().numpy()   # voxel space
@@ -397,6 +408,7 @@ class Parameterizer:
             normal_offsets=offsets,
             verbose=False,
             backend=backend,
+            hull_mask=hull_mask,
         )
 
         multilayer = np.stack(layers, axis=0)
@@ -469,6 +481,7 @@ class ProjectedFrame:
     pts_mean: np.ndarray              # (3,) normalization offset
     volume: Optional[np.ndarray] = None  # (Z, Y, X) source intensity volume (for 3D-native)
     multilayer: Optional[np.ndarray] = None  # (L, H, W) multi-offset projection stack
+    hull_mask: Optional[np.ndarray] = None  # (H, W) bool — True = inside UV support
     t: int = 0
 
     @property
@@ -484,14 +497,21 @@ class ProjectedFrame:
         t: int = 0,
         uv_res: int = 512,
         offsets: Optional[np.ndarray] = None,
+        use_hull_mask: bool = False,
     ) -> "ProjectedFrame":
         """Build a ProjectedFrame from a trained Parameterizer and its volume."""
         multilayer, xyz_map_voxel, xyz_map_norm = param.project_to_uv_along_normals(
             volume, uv_res=uv_res, offsets=offsets, return_maps=True,
+            use_hull_mask=use_hull_mask,
         )
         pts_mean = param.pts_mean
         pts_mean = (pts_mean.detach().cpu().numpy()
                     if isinstance(pts_mean, torch.Tensor) else np.asarray(pts_mean))
+        hull_mask = None
+        if use_hull_mask and param.uv_map is not None:
+            from seamless.core.geometry import uv_convex_hull_mask
+            hull_mask = uv_convex_hull_mask(param.uv_map, uv_res)
+
         return cls(
             nuvo_model=param.get_model(),
             xyz_map_voxel=np.asarray(xyz_map_voxel, dtype=np.float32),
@@ -501,6 +521,7 @@ class ProjectedFrame:
             pts_std=float(param.pts_std),
             pts_mean=pts_mean.astype(np.float32),
             volume=np.asarray(volume),
+            hull_mask=hull_mask,
             t=t,
         )
 

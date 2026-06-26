@@ -57,6 +57,7 @@ def project_surface(
     normal_offsets: np.ndarray | None = None,
     verbose: bool = False,
     backend: str = "batched",
+    hull_mask: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Project a trained neural surface mapping through a 3D volume.
 
@@ -80,6 +81,10 @@ def project_surface(
                         Default: linspace(-5, 5, 6).
         verbose: Print progress messages.
         backend: "batched" (detailed logging, safe) or "optimized" (fast, all-at-once).
+        hull_mask: Optional (uv_res, uv_res) bool array. Pixels where False are set to
+                   np.nan in every returned layer. Use uv_convex_hull_mask() to build one
+                   from the actual UV point cloud to avoid extrapolation artefacts outside
+                   the surface's UV support.
 
     Returns:
         layers: List of (uv_res, uv_res) sampled layers.
@@ -107,6 +112,7 @@ def project_surface(
             mesh_to_vol_scale,
             normal_offsets,
             verbose,
+            hull_mask,
         )
     elif backend == "optimized":
         return _project_surface_optimized(
@@ -122,6 +128,7 @@ def project_surface(
             mesh_to_vol_scale,
             normal_offsets,
             verbose,
+            hull_mask,
         )
     else:
         raise ValueError(f"Unknown backend: {backend}. Choose 'batched' or 'optimized'.")
@@ -140,6 +147,7 @@ def _project_surface_batched(
     mesh_to_vol_scale: np.ndarray,
     normal_offsets: np.ndarray,
     verbose: bool,
+    hull_mask: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Batched projection backend with detailed logging."""
     eps = 2.0 / uv_res
@@ -205,6 +213,11 @@ def _project_surface_batched(
         )
         layers.append(layer.reshape(uv_res, uv_res))
 
+    if hull_mask is not None:
+        for i in range(len(layers)):
+            layers[i] = layers[i].astype(np.float32)
+            layers[i][~hull_mask] = np.nan
+
     # Raw (unsmoothed) voxel-space XYZ map for downstream PIV lifting
     xyz_map_voxel = (xyz_norm * points.std() + points.mean(axis=0)) * mesh_to_vol_scale
     xyz_map_norm = xyz_norm
@@ -225,6 +238,7 @@ def _project_surface_optimized(
     mesh_to_vol_scale: np.ndarray,
     normal_offsets: np.ndarray,
     verbose: bool,
+    hull_mask: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Fast all-at-once projection backend (lower memory, less logging)."""
     eps = 2.0 / uv_res
@@ -267,6 +281,11 @@ def _project_surface_optimized(
             cval=0.0,
         )
         layers.append(layer.reshape(uv_res, uv_res))
+
+    if hull_mask is not None:
+        for i in range(len(layers)):
+            layers[i] = layers[i].astype(np.float32)
+            layers[i][~hull_mask] = np.nan
 
     # Raw XYZ map for downstream use
     xyz_map_voxel = (xyz_norm * points.std() + points.mean(axis=0)) * mesh_to_vol_scale
