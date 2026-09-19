@@ -232,7 +232,7 @@ def train_nuvo(
 ) -> tuple["NuvoMLP", np.ndarray, np.ndarray]:
     """Train NuvoMLP with a 3-phase curriculum."""
     if verbose:
-        _print_sep("Phase 5 – Nuvo Parameterisation")
+        _print_sep("Phase 5 - Nuvo Parameterisation")
         print(f"  num_charts={num_charts}  topology={topology}  pe_degree={pe_degree}")
         warm_label = "Phase A (warm-up) → " if (base_model is None and use_warm_start) else ""
         print(f"  curriculum: {warm_label}Phase B (geometry) → Phase C (full Nuvo)\n")

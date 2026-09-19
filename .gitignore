@@ -132,8 +132,9 @@ plots/
 # Jupyter notebooks & checkpoints
 # ---------------------------------------------------------------------------
 .ipynb_checkpoints/
+# Exclude all notebooks, then allow example notebooks back in (order matters: the
+# exclusion must come first, or the exception has no effect).
 *.ipynb
-# Allow example notebooks (must come after the blanket rule)
 !examples/*.ipynb
 
 # ---------------------------------------------------------------------------
@@ -164,7 +165,6 @@ docs/
 .claude/
 deprecated/
 notebooks/
-# Note: examples/ is selectively included above (notebooks + synthetic data)
-
-# Private Claude context — synced manually (e.g. rsync) between machines, never committed
 CLAUDE.local.md
+# Note: examples/ is selectively included above (notebooks + synthetic data)
+CLAUDE.md

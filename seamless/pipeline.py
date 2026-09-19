@@ -36,6 +36,7 @@ from seamless.flow.piv import (
 from seamless.flow.losses import trilinear_sample
 from seamless.utils.saving import save_analysis_results
 from seamless.utils.loading import load_projections_complete
+from seamless.utils.ome_zarr import OMEZarrDataset, OMEZarrVolumeSequence, rescale_voxel_coords
 
 from seamless.config import (
     ParameterizationConfig, PIVConfig, TwoDNeuralConfig, ThreeDNativeConfig,
@@ -247,27 +248,7 @@ class Parameterizer:
         """
         from skimage.measure import marching_cubes
 
-        seg = np.asarray(segmentation)
-        unique_labels, label_counts = np.unique(seg, return_counts=True)
-        is_binary = seg.dtype == bool or set(unique_labels).issubset({0, 1})
-
-        if is_binary:
-            binary = seg.astype(bool)
-        elif label is not None:
-            binary = seg == label
-        else:
-            fg_mask = unique_labels != 0
-            if not fg_mask.any():
-                raise ValueError("Segmentation contains no foreground labels.")
-            best_label = unique_labels[fg_mask][label_counts[fg_mask].argmax()]
-            binary = seg == best_label
-
-        if not binary.any():
-            raise ValueError(
-                "No foreground voxels found"
-                + (f" for label={label}." if label is not None else ".")
-            )
-
+        binary = _binarize_segmentation(segmentation, label=label)
         points, _, _, _ = marching_cubes(binary, level=0.5, step_size=1)
 
         rng = np.random.default_rng(seed)
@@ -282,6 +263,104 @@ class Parameterizer:
             num_charts=num_charts,
             device=device,
             config=config,
+        )
+
+    @classmethod
+    def from_ome_zarr(
+        cls,
+        store: str | Path,
+        topology: str,
+        *,
+        t: int = 0,
+        level: int,
+        channel: int = 0,
+        label_name: Optional[str] = None,
+        label_level: Optional[int] = None,
+        label_id: Optional[int] = None,
+        threshold: Optional[float] = None,
+        num_target_points: int = 20_000,
+        num_charts: int = 1,
+        device: Optional[torch.device] = None,
+        config: Optional[ParameterizationConfig] = None,
+        seed: int = 42,
+    ) -> "Parameterizer":
+        """Build a Parameterizer from one timepoint of an OME-Zarr (OME-NGFF) store.
+
+        Requires exactly one of ``label_name`` or ``threshold`` -- there is no default
+        segmentation strategy. Prefer ``label_name`` (a precomputed segmentation under the
+        store's ``labels/<name>/`` sub-group, per the OME-NGFF labels extension) whenever one
+        is available: a single global intensity ``threshold`` is dataset-specific and rarely
+        a valid way to segment real microscopy data; it mainly exists for synthetic or
+        already-thresholded data.
+
+        Args:
+            store: Path to the OME-Zarr store root.
+            topology: Nuvo topology string ('cylinder', 'sphere', 'bent_sheet').
+            t: Timepoint index to read.
+            level: Pyramid level to read the intensity volume from (required -- no
+                default, since resolution-dependent parameters like ``num_target_points``
+                and a silently-chosen level could otherwise OOM or silently misbehave).
+            channel: Channel index to read.
+            label_name: Name of a ``labels/<name>/`` sub-group holding a precomputed
+                segmentation. When given, the surface is extracted from it directly (no
+                threshold needed).
+            label_level: Pyramid level to read the label volume from. Defaults to ``level``.
+                May safely differ from ``level`` -- e.g. run ``marching_cubes`` on a coarse,
+                fast label level while projecting against a fine intensity level. When it
+                does differ, the extracted surface points are rescaled from the label
+                level's voxel grid into the intensity level's voxel grid via each level's
+                physical scale/translation (see
+                :func:`~seamless.utils.ome_zarr.rescale_voxel_coords`) -- voxel indices are
+                not directly comparable across pyramid levels, so skipping this would
+                silently sample the wrong location.
+            label_id: For a multi-label segmentation, the integer label to use. If None,
+                the label with the most voxels (excluding 0) is chosen. Ignored for binary
+                masks.
+            threshold: Intensity threshold for binarization (forwarded to
+                :meth:`from_volume`). Mutually exclusive with ``label_name``.
+            num_target_points, num_charts, device, config, seed: forwarded as in
+                :meth:`from_volume`/:meth:`from_segmentation`.
+        """
+        if (label_name is None) == (threshold is None):
+            raise ValueError(
+                "Parameterizer.from_ome_zarr requires exactly one of `label_name` or "
+                "`threshold` -- a single intensity threshold rarely segments real "
+                "microscopy data correctly, so there is no default; pass `label_name` to "
+                "use a precomputed segmentation, or `threshold` only for synthetic/"
+                "already-thresholded data."
+            )
+
+        dataset = OMEZarrDataset(store)
+
+        if label_name is None:
+            volume = dataset.read_volume(t, level, channel)
+            return cls.from_volume(
+                volume, topology, threshold=threshold,
+                num_target_points=num_target_points, num_charts=num_charts,
+                device=device, config=config, seed=seed,
+            )
+
+        from skimage.measure import marching_cubes
+
+        label_ds = dataset.label_dataset(label_name)
+        seg_level_idx = label_level if label_level is not None else level
+        segmentation = label_ds.read_volume(t, seg_level_idx)
+
+        binary = _binarize_segmentation(segmentation, label=label_id)
+        points, _, _, _ = marching_cubes(binary, level=0.5, step_size=1)
+
+        if seg_level_idx != level:
+            points = rescale_voxel_coords(
+                points, label_ds.get_level(seg_level_idx), dataset.get_level(level))
+
+        rng = np.random.default_rng(seed)
+        if len(points) > num_target_points:
+            idx = rng.choice(len(points), size=num_target_points, replace=False)
+            points = points[idx]
+
+        return cls(
+            points, normals=None, topology=topology, num_charts=num_charts,
+            device=device, config=config,
         )
 
     # ------------------------------------------------------------------ #
@@ -487,6 +566,58 @@ def _find_volume_key(f: h5py.File) -> str:
     raise RuntimeError("No 3D/4D volume dataset found in HDF5 file.")
 
 
+def _binarize_segmentation(segmentation: np.ndarray, label: Optional[int] = None) -> np.ndarray:
+    """Reduce a binary or labeled (Z, Y, X) segmentation array to a boolean foreground mask.
+
+    Binary (bool or 0/1 integer): all foreground voxels are used. Labeled (multi-value
+    integer): ``label`` picks one object, or the label with the most voxels (excluding 0)
+    is chosen when ``label`` is None. Shared by :meth:`Parameterizer.from_segmentation` and
+    :meth:`Parameterizer.from_ome_zarr`'s label-driven path.
+    """
+    seg = np.asarray(segmentation)
+    unique_labels, label_counts = np.unique(seg, return_counts=True)
+    is_binary = seg.dtype == bool or set(unique_labels).issubset({0, 1})
+
+    if is_binary:
+        binary = seg.astype(bool)
+    elif label is not None:
+        binary = seg == label
+    else:
+        fg_mask = unique_labels != 0
+        if not fg_mask.any():
+            raise ValueError("Segmentation contains no foreground labels.")
+        best_label = unique_labels[fg_mask][label_counts[fg_mask].argmax()]
+        binary = seg == best_label
+
+    if not binary.any():
+        raise ValueError(
+            "No foreground voxels found" + (f" for label={label}." if label is not None else ".")
+        )
+    return binary
+
+
+def _is_indexable(obj) -> bool:
+    """True for anything already usable as a per-timepoint sequence (list, ndarray-of-
+    arrays, or a lazy sequence such as OMEZarrVolumeSequence) without eager materialization.
+    """
+    return hasattr(obj, "__len__") and hasattr(obj, "__getitem__")
+
+
+class _LazyVolume:
+    """Backs :attr:`ProjectedFrame.volume` with a ``(sequence, index)`` pair instead of a
+    stored array. Implements numpy's ``__array__`` protocol, so every existing consumer
+    (``np.asarray(ft.volume, dtype=...)``) resolves it transparently -- one disk read per
+    call, not a dense array pinned for the object's lifetime.
+    """
+
+    def __init__(self, sequence, index: int):
+        self._sequence = sequence
+        self._index = index
+
+    def __array__(self, dtype=None) -> np.ndarray:
+        return np.asarray(self._sequence[self._index], dtype=dtype)
+
+
 @dataclass
 class ProjectedFrame:
     """A single parameterized timepoint: UV grid + NuvoMLP + (optional) volume.
@@ -503,7 +634,8 @@ class ProjectedFrame:
     max_projection: np.ndarray        # (H, W) intensity max-projection
     pts_std: float                    # normalization scale (normalized -> voxel)
     pts_mean: np.ndarray              # (3,) normalization offset
-    volume: Optional[np.ndarray] = None  # (Z, Y, X) source intensity volume (for 3D-native)
+    volume: Optional[object] = None  # (Z, Y, X) source intensity volume (for 3D-native);
+                                      # np.ndarray, or a _LazyVolume resolved via __array__
     multilayer: Optional[np.ndarray] = None  # (L, H, W) multi-offset projection stack
     hull_mask: Optional[np.ndarray] = None  # (H, W) bool — True = inside UV support
     t: int = 0
@@ -522,8 +654,14 @@ class ProjectedFrame:
         uv_res: int = 512,
         offsets: Optional[np.ndarray] = None,
         use_hull_mask: bool = False,
+        stored_volume: Optional[object] = None,
     ) -> "ProjectedFrame":
-        """Build a ProjectedFrame from a trained Parameterizer and its volume."""
+        """Build a ProjectedFrame from a trained Parameterizer and its volume.
+
+        ``stored_volume``, when given, is stored on the frame instead of a dense copy of
+        ``volume`` -- used to pass a :class:`_LazyVolume` so the frame doesn't pin a dense
+        array for its whole lifetime (see :meth:`SeamlessPipeline.parameterize`).
+        """
         result = param.project_to_uv_along_normals(
             volume, uv_res=uv_res, offsets=offsets, return_maps=True,
             use_hull_mask=use_hull_mask,
@@ -556,7 +694,7 @@ class ProjectedFrame:
             multilayer=np.asarray(multilayer, dtype=np.float32),
             pts_std=float(param.pts_std),
             pts_mean=pts_mean.astype(np.float32),
-            volume=np.asarray(volume),
+            volume=stored_volume if stored_volume is not None else np.asarray(volume),
             hull_mask=hull_mask,
             t=t,
         )
@@ -1024,6 +1162,7 @@ class SeamlessPipeline:
         topology: str = "cylinder",
         method: str = "3d_native",
         *,
+        segmentations=None,
         threshold: float = 43,
         num_target_points: int = 20_000,
         uv_res: int = 512,
@@ -1037,18 +1176,35 @@ class SeamlessPipeline:
         """Initialize the pipeline.
 
         Args:
-            volumes: Iterable of (Z, Y, X) intensity/segmentation volumes, one per
-                timepoint (e.g. ``f['microscopy_mockup'][:]``). See :meth:`from_h5`.
+            volumes: Iterable of (Z, Y, X) intensity volumes, one per timepoint (e.g.
+                ``f['microscopy_mockup'][:]``, or a lazy sequence such as
+                :class:`~seamless.utils.ome_zarr.OMEZarrVolumeSequence` -- see
+                :meth:`from_h5`/:meth:`from_ome_zarr`). Already index-addressable inputs
+                (anything with ``__len__``/``__getitem__``, including a lazy sequence) are
+                kept as-is rather than eagerly materialized; plain iterables/generators are
+                converted to a list.
             topology: Nuvo topology string ('cylinder', 'sphere', 'bent_sheet').
             method: Default flow method ('piv', '2d_neural', '3d_native').
-            threshold: Surface-extraction binarization threshold.
+            segmentations: Optional iterable of (Z, Y, X) binary/labeled segmentation
+                arrays, parallel to ``volumes`` (same length). When given, surface
+                extraction uses :meth:`Parameterizer.from_segmentation` on these arrays
+                instead of thresholding ``volumes`` -- ``threshold`` is then ignored. The
+                intensity volumes in ``volumes`` are still what gets projected/used for
+                ``3d_native`` flow regardless.
+            threshold: Surface-extraction binarization threshold, used only when
+                ``segmentations`` is None.
             num_target_points: Surface points per frame after subsampling.
             uv_res: UV grid resolution for the projection.
             device: Torch device (auto-detected if None).
             param_config / piv_config / two_d_config / three_d_config /
             kinematics_config: Optional config overrides (defaults used if None).
         """
-        self.volumes = [np.asarray(v) for v in volumes]
+        self.volumes = volumes if _is_indexable(volumes) else [np.asarray(v) for v in volumes]
+        self.segmentations = (
+            None if segmentations is None
+            else segmentations if _is_indexable(segmentations)
+            else [np.asarray(s) for s in segmentations]
+        )
         self.topology = topology
         self.method = method
         self.threshold = threshold
@@ -1083,6 +1239,81 @@ class SeamlessPipeline:
             data = f[key][:] if n_frames is None else f[key][:n_frames]
         return cls(list(data), topology=topology, **kwargs)
 
+    @classmethod
+    def from_ome_zarr(
+        cls,
+        store: str | Path,
+        topology: str,
+        *,
+        level: int,
+        channel: int = 0,
+        label_name: Optional[str] = None,
+        label_level: Optional[int] = None,
+        threshold: Optional[float] = None,
+        n_frames: Optional[int] = None,
+        **kwargs,
+    ) -> "SeamlessPipeline":
+        """Build from an OME-Zarr (OME-NGFF) store.
+
+        Requires exactly one of ``label_name`` or ``threshold`` -- see
+        :meth:`Parameterizer.from_ome_zarr` for the rationale. Reads lazily: at most one
+        timepoint's intensity volume, and (independently) at most two adjacent timepoints'
+        intensity volumes during ``3d_native`` flow estimation, are ever resident in memory
+        at once -- never the whole timeseries (see :meth:`parameterize`).
+
+        Args:
+            store: Path to the OME-Zarr store root.
+            topology: Nuvo topology string ('cylinder', 'sphere', 'bent_sheet').
+            level: Pyramid level to read intensity volumes from (required).
+            channel: Channel index to read.
+            label_name: Name of a ``labels/<name>/`` sub-group holding a precomputed
+                segmentation, used for surface extraction instead of thresholding.
+            label_level: Pyramid level to read label volumes from. Defaults to ``level``.
+                Unlike :meth:`Parameterizer.from_ome_zarr`, this method does **not** yet
+                support a ``label_level`` that differs from ``level`` -- passing one raises
+                ``NotImplementedError`` rather than silently sampling the intensity volume
+                at the wrong voxel coordinates (surface points would be in the label
+                level's voxel grid, not the intensity level's). Use
+                :meth:`Parameterizer.from_ome_zarr` directly (which does rescale) if you
+                need mismatched levels, or pass matching levels here.
+            threshold: Intensity threshold for binarization. Mutually exclusive with
+                ``label_name``.
+            n_frames: Limit to the first ``n_frames`` timepoints.
+            **kwargs: Forwarded to :meth:`__init__` (topology/method/config overrides, etc).
+        """
+        if (label_name is None) == (threshold is None):
+            raise ValueError(
+                "SeamlessPipeline.from_ome_zarr requires exactly one of `label_name` or "
+                "`threshold` -- a single intensity threshold rarely segments real "
+                "microscopy data correctly, so there is no default; pass `label_name` to "
+                "use a precomputed segmentation, or `threshold` only for synthetic/"
+                "already-thresholded data."
+            )
+        if label_name is not None and label_level is not None and label_level != level:
+            raise NotImplementedError(
+                "SeamlessPipeline.from_ome_zarr does not yet rescale surface points "
+                "between a `label_level` that differs from `level` -- use "
+                "Parameterizer.from_ome_zarr directly for that (it rescales via "
+                "seamless.utils.ome_zarr.rescale_voxel_coords), or pass matching levels."
+            )
+
+        dataset = OMEZarrDataset(store)
+        volumes = OMEZarrVolumeSequence(dataset, level=level, channel=channel, n_frames=n_frames)
+
+        segmentations = None
+        if label_name is not None:
+            label_ds = dataset.label_dataset(label_name)
+            segmentations = OMEZarrVolumeSequence(
+                label_ds, level=label_level if label_level is not None else level,
+                n_frames=n_frames)
+            # `threshold` is unused whenever `segmentations` is set (parameterize() only
+            # reads self.threshold in the from_volume branch) -- pass a harmless placeholder
+            # so __init__'s non-Optional `threshold: float = 43` stays satisfied.
+            threshold = 43
+
+        return cls(volumes, topology=topology, segmentations=segmentations,
+                    threshold=threshold, **kwargs)
+
     # ------------------------------------------------------------------ #
     # Pipeline steps
     # ------------------------------------------------------------------ #
@@ -1094,20 +1325,37 @@ class SeamlessPipeline:
         warm_iters: int = 300,
         verbose: bool = False,
     ) -> List[ProjectedFrame]:
-        """Parameterize every timepoint (warm-started across the sequence)."""
+        """Parameterize every timepoint (warm-started across the sequence).
+
+        Reads and discards one timepoint's intensity (and, if ``self.segmentations`` is
+        set, segmentation) volume at a time -- never holds the whole timeseries resident.
+        When the source volumes are a lazy sequence (see :meth:`from_ome_zarr`), each
+        frame's stored volume is a :class:`_LazyVolume` that re-reads from disk on demand
+        instead of pinning a dense array for the pipeline's lifetime.
+        """
         base = None
         self.frames = []
-        for t, vol in enumerate(self.volumes):
-            p = Parameterizer.from_volume(
-                vol, self.topology, threshold=self.threshold,
-                num_target_points=self.num_target_points,
-                device=self.device, config=self.param_config)
+        volumes_are_lazy = getattr(self.volumes, "lazy", False)
+        for t in range(len(self.volumes)):
+            vol = np.asarray(self.volumes[t])
+            if self.segmentations is not None:
+                seg = np.asarray(self.segmentations[t])
+                p = Parameterizer.from_segmentation(
+                    seg, self.topology, num_target_points=self.num_target_points,
+                    device=self.device, config=self.param_config)
+            else:
+                p = Parameterizer.from_volume(
+                    vol, self.topology, threshold=self.threshold,
+                    num_target_points=self.num_target_points,
+                    device=self.device, config=self.param_config)
             p.train(iterations=iterations,
                     base_model=base if warm_start else None,
                     warm_iters=warm_iters, verbose=verbose)
             base = p.get_model()
+            stored_volume = _LazyVolume(self.volumes, t) if volumes_are_lazy else None
             self.frames.append(
-                ProjectedFrame.from_parameterizer(p, vol, t=t, uv_res=self.uv_res))
+                ProjectedFrame.from_parameterizer(
+                    p, vol, t=t, uv_res=self.uv_res, stored_volume=stored_volume))
         return self.frames
 
     def save_projection(self, path: str | Path) -> None:
