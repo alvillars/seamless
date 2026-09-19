@@ -31,6 +31,9 @@ def __getattr__(name):
     elif name == "seeds_to_voxel":
         from seamless.core.validation import seeds_to_voxel
         return seeds_to_voxel
+    elif name in ("uv_grid", "uv_convex_hull_mask", "volume_to_tensor"):
+        from seamless.core import geometry as _g
+        return getattr(_g, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -38,4 +41,7 @@ __all__ = [
     "compute_error_metrics",
     "match_seeds_to_uv",
     "seeds_to_voxel",
+    "uv_grid",
+    "uv_convex_hull_mask",
+    "volume_to_tensor",
 ]

@@ -292,7 +292,9 @@ class Parameterizer:
         iterations: Optional[int] = None,
         base_model: Optional[NuvoMLP] = None,
         warm_iters: int = 300,
+        use_warm_start: Optional[bool] = None,
         phase_b_ratio: float = 0.0,
+        lr: Optional[float] = None,
         verbose: bool = False,
     ) -> NuvoMLP:
         """Train the NuvoMLP parameterization.
@@ -306,9 +308,13 @@ class Parameterizer:
                 fine-tuned — reproducing the legacy time-series strategy (full
                 train at t=0, short fine-tune for t>0).
             warm_iters: Analytical-UV warm-up iterations (ignored when
-                ``base_model`` is given).
+                ``base_model`` is given or ``use_warm_start=False``).
+            use_warm_start: Whether to run the analytical-UV Phase A before the
+                curriculum. Defaults to ``config.use_warm_start`` (True).
             phase_b_ratio: Fraction of iterations spent in geometry-only Phase B.
                 Defaults to 0.0 to match the legacy projection pipeline.
+            lr: Adam learning rate for the main training loop. Defaults to
+                ``config.lr`` (3e-4).
             verbose: Forward training logs.
 
         Returns:
@@ -320,6 +326,10 @@ class Parameterizer:
                 if base_model is not None
                 else self.config.iterations_t0
             )
+        if lr is None:
+            lr = self.config.lr
+        if use_warm_start is None:
+            use_warm_start = self.config.use_warm_start
 
         self.model, self.uv_map, self.chart_ids = train_nuvo(
             pts_fixed=self.xyz,
@@ -330,7 +340,9 @@ class Parameterizer:
             topology=self.topology,
             pe_degree=self.config.t_pe_degree,
             warm_iters=warm_iters,
+            use_warm_start=use_warm_start,
             phase_b_ratio=phase_b_ratio,
+            lr=lr,
             base_model=base_model,
             verbose=verbose,
         )
@@ -345,6 +357,7 @@ class Parameterizer:
         mesh_to_vol_scale: Optional[np.ndarray] = None,
         backend: str = "batched",
         return_maps: bool = False,
+        use_hull_mask: bool = False,
     ):
         """Project ``volume`` onto the trained UV grid along surface normals.
 
@@ -357,6 +370,9 @@ class Parameterizer:
             mesh_to_vol_scale: (3,) normalized→voxel scaling (default [1, 1, 1]).
             backend: 'batched' (safe, logged) or 'optimized' (fast).
             return_maps: If True, also return the (uv_res, uv_res, 3) XYZ maps.
+            use_hull_mask: If True, pixels outside the Delaunay triangulation of the
+                training UV point cloud are set to NaN in every returned layer, avoiding
+                extrapolation artefacts at the border of the UV support.
 
         Returns:
             ``multilayer`` of shape (len(offsets), uv_res, uv_res); the max
@@ -367,6 +383,7 @@ class Parameterizer:
             raise RuntimeError("Model not trained yet. Call .train() first.")
 
         from seamless.cartography.projection import project_surface
+        from seamless.core.geometry import uv_convex_hull_mask
 
         if offsets is None:
             offsets = np.linspace(-5.0, 5.0, 6)
@@ -382,27 +399,46 @@ class Parameterizer:
 
         norm_points = self.xyz.detach().cpu().numpy()             # normalized space
         points_voxel = self.points_voxel.detach().cpu().numpy()   # voxel space
-
-        layers, xyz_map_voxel, xyz_map_norm = project_surface(
-            map_model=self.model,
-            uv_flat=uv_flat,
-            vol=np.ascontiguousarray(volume, dtype=np.float32),
-            norm_points=norm_points,
-            points=points_voxel,
-            topology=self.topology,
-            device=self.device,
-            uv_res=uv_res,
-            smooth_sigma=smooth_sigma,
-            mesh_to_vol_scale=mesh_to_vol_scale,
-            normal_offsets=offsets,
-            verbose=False,
-            backend=backend,
+        vol = np.ascontiguousarray(volume, dtype=np.float32)
+        shared = dict(
+            map_model=self.model, uv_flat=uv_flat, vol=vol,
+            norm_points=norm_points, points=points_voxel,
+            topology=self.topology, device=self.device, uv_res=uv_res,
+            smooth_sigma=smooth_sigma, mesh_to_vol_scale=mesh_to_vol_scale,
+            normal_offsets=offsets, verbose=False, backend=backend,
         )
 
-        multilayer = np.stack(layers, axis=0)
+        num_charts = self.num_charts
+        multilayers, xyz_voxel_maps, xyz_norm_maps = [], [], []
+
+        for k in range(num_charts):
+            # Per-chart hull mask: extract UV coords for chart k (u in [k, k+1])
+            # and normalize back to [0, 1] before computing the Delaunay support.
+            hull_mask_k = None
+            if use_hull_mask:
+                if self.uv_map is None:
+                    raise RuntimeError("uv_map not available. Call .train() first.")
+                mask_k = self.chart_ids == k
+                uv_k = self.uv_map[mask_k].copy()
+                uv_k[:, 0] -= k          # shift back to [0, 1]
+                hull_mask_k = uv_convex_hull_mask(uv_k, uv_res)
+
+            layers, xyz_map_voxel, xyz_map_norm = project_surface(
+                **shared, chart_idx=k, hull_mask=hull_mask_k,
+            )
+            multilayers.append(np.stack(layers, axis=0))
+            xyz_voxel_maps.append(xyz_map_voxel)
+            xyz_norm_maps.append(xyz_map_norm)
+
+        # Single-chart: preserve original (non-list) return type for backward compat.
+        if num_charts == 1:
+            if return_maps:
+                return multilayers[0], xyz_voxel_maps[0], xyz_norm_maps[0]
+            return multilayers[0]
+
         if return_maps:
-            return multilayer, xyz_map_voxel, xyz_map_norm
-        return multilayer
+            return multilayers, xyz_voxel_maps, xyz_norm_maps
+        return multilayers
 
     # ------------------------------------------------------------------ #
     # Accessors
@@ -469,6 +505,7 @@ class ProjectedFrame:
     pts_mean: np.ndarray              # (3,) normalization offset
     volume: Optional[np.ndarray] = None  # (Z, Y, X) source intensity volume (for 3D-native)
     multilayer: Optional[np.ndarray] = None  # (L, H, W) multi-offset projection stack
+    hull_mask: Optional[np.ndarray] = None  # (H, W) bool — True = inside UV support
     t: int = 0
 
     @property
@@ -484,14 +521,33 @@ class ProjectedFrame:
         t: int = 0,
         uv_res: int = 512,
         offsets: Optional[np.ndarray] = None,
+        use_hull_mask: bool = False,
     ) -> "ProjectedFrame":
         """Build a ProjectedFrame from a trained Parameterizer and its volume."""
-        multilayer, xyz_map_voxel, xyz_map_norm = param.project_to_uv_along_normals(
+        result = param.project_to_uv_along_normals(
             volume, uv_res=uv_res, offsets=offsets, return_maps=True,
+            use_hull_mask=use_hull_mask,
         )
         pts_mean = param.pts_mean
         pts_mean = (pts_mean.detach().cpu().numpy()
                     if isinstance(pts_mean, torch.Tensor) else np.asarray(pts_mean))
+
+        # Multi-chart: tile charts side-by-side along the width axis so the
+        # ProjectedFrame schema stays (L, H, K*W) / (H, K*W, 3), consistent
+        # with the uv_map tiling where chart k occupies u ∈ [k, k+1].
+        if isinstance(result[0], list):
+            multilayers, xyz_voxel_list, xyz_norm_list = result
+            multilayer    = np.concatenate(multilayers,    axis=2)   # (L, H, K*W)
+            xyz_map_voxel = np.concatenate(xyz_voxel_list, axis=1)   # (H, K*W, 3)
+            xyz_map_norm  = np.concatenate(xyz_norm_list,  axis=1)   # (H, K*W, 3)
+        else:
+            multilayer, xyz_map_voxel, xyz_map_norm = result
+
+        hull_mask = None
+        if use_hull_mask and param.uv_map is not None:
+            from seamless.core.geometry import uv_convex_hull_mask
+            hull_mask = uv_convex_hull_mask(param.uv_map, uv_res)
+
         return cls(
             nuvo_model=param.get_model(),
             xyz_map_voxel=np.asarray(xyz_map_voxel, dtype=np.float32),
@@ -501,6 +557,7 @@ class ProjectedFrame:
             pts_std=float(param.pts_std),
             pts_mean=pts_mean.astype(np.float32),
             volume=np.asarray(volume),
+            hull_mask=hull_mask,
             t=t,
         )
 

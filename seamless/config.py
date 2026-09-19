@@ -76,6 +76,8 @@ class ParameterizationConfig:
     s_pe_degree: int = 2             # positional encoding degree for surface coords
     iterations_t0: int = 300         # iterations at t=0
     iterations_warm_start: int = 50  # iterations for warm-start (t>0)
+    lr: float = 3e-4                 # Adam learning rate for the main training loop
+    use_warm_start: bool = True      # run analytical-UV Phase A before curriculum
 
 
 @dataclass

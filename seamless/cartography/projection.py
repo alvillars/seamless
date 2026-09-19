@@ -57,6 +57,8 @@ def project_surface(
     normal_offsets: np.ndarray | None = None,
     verbose: bool = False,
     backend: str = "batched",
+    chart_idx: int = 0,
+    hull_mask: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Project a trained neural surface mapping through a 3D volume.
 
@@ -80,6 +82,11 @@ def project_surface(
                         Default: linspace(-5, 5, 6).
         verbose: Print progress messages.
         backend: "batched" (detailed logging, safe) or "optimized" (fast, all-at-once).
+        chart_idx: Which NuvoMLP chart to evaluate (0 for single-chart models).
+        hull_mask: Optional (uv_res, uv_res) bool array. Pixels where False are set to
+                   np.nan in every returned layer. Use uv_convex_hull_mask() to build one
+                   from the actual UV point cloud to avoid extrapolation artefacts outside
+                   the surface's UV support.
 
     Returns:
         layers: List of (uv_res, uv_res) sampled layers.
@@ -95,33 +102,15 @@ def project_surface(
 
     if backend == "batched":
         return _project_surface_batched(
-            map_model,
-            uv_flat,
-            vol,
-            norm_points,
-            points,
-            topology,
-            device,
-            uv_res,
-            smooth_sigma,
-            mesh_to_vol_scale,
-            normal_offsets,
-            verbose,
+            map_model, uv_flat, vol, norm_points, points, topology, device,
+            uv_res, smooth_sigma, mesh_to_vol_scale, normal_offsets, verbose,
+            chart_idx, hull_mask,
         )
     elif backend == "optimized":
         return _project_surface_optimized(
-            map_model,
-            uv_flat,
-            vol,
-            norm_points,
-            points,
-            topology,
-            device,
-            uv_res,
-            smooth_sigma,
-            mesh_to_vol_scale,
-            normal_offsets,
-            verbose,
+            map_model, uv_flat, vol, norm_points, points, topology, device,
+            uv_res, smooth_sigma, mesh_to_vol_scale, normal_offsets, verbose,
+            chart_idx, hull_mask,
         )
     else:
         raise ValueError(f"Unknown backend: {backend}. Choose 'batched' or 'optimized'.")
@@ -140,10 +129,11 @@ def _project_surface_batched(
     mesh_to_vol_scale: np.ndarray,
     normal_offsets: np.ndarray,
     verbose: bool,
+    chart_idx: int = 0,
+    hull_mask: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Batched projection backend with detailed logging."""
     eps = 2.0 / uv_res
-    chart_idx = 0
 
     # Perturbed UV grids for finite-difference normal estimation
     uv_pu = uv_flat.copy()
@@ -205,6 +195,11 @@ def _project_surface_batched(
         )
         layers.append(layer.reshape(uv_res, uv_res))
 
+    if hull_mask is not None:
+        for i in range(len(layers)):
+            layers[i] = layers[i].astype(np.float32)
+            layers[i][~hull_mask] = np.nan
+
     # Raw (unsmoothed) voxel-space XYZ map for downstream PIV lifting
     xyz_map_voxel = (xyz_norm * points.std() + points.mean(axis=0)) * mesh_to_vol_scale
     xyz_map_norm = xyz_norm
@@ -225,6 +220,8 @@ def _project_surface_optimized(
     mesh_to_vol_scale: np.ndarray,
     normal_offsets: np.ndarray,
     verbose: bool,
+    chart_idx: int = 0,
+    hull_mask: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Fast all-at-once projection backend (lower memory, less logging)."""
     eps = 2.0 / uv_res
@@ -236,10 +233,10 @@ def _project_surface_optimized(
     uv_mv = np.clip(uv_flat - np.array([0, eps]), 0, 1)
 
     # All-at-once evaluation
-    f_pu = eval_surface(map_model, uv_pu, batch_size=None, device=device)
-    f_mu = eval_surface(map_model, uv_mu, batch_size=None, device=device)
-    f_pv = eval_surface(map_model, uv_pv, batch_size=None, device=device)
-    f_mv = eval_surface(map_model, uv_mv, batch_size=None, device=device)
+    f_pu = eval_surface(map_model, uv_pu, batch_size=None, chart_idx=chart_idx, device=device)
+    f_mu = eval_surface(map_model, uv_mu, batch_size=None, chart_idx=chart_idx, device=device)
+    f_pv = eval_surface(map_model, uv_pv, batch_size=None, chart_idx=chart_idx, device=device)
+    f_mv = eval_surface(map_model, uv_mv, batch_size=None, chart_idx=chart_idx, device=device)
 
     tangent_u = (smooth_field(f_pu, uv_res, smooth_sigma) - smooth_field(f_mu, uv_res, smooth_sigma)) / (2 * eps)
     tangent_v = (smooth_field(f_pv, uv_res, smooth_sigma) - smooth_field(f_mv, uv_res, smooth_sigma)) / (2 * eps)
@@ -247,7 +244,7 @@ def _project_surface_optimized(
     normals_neural /= np.linalg.norm(normals_neural, axis=1, keepdims=True) + 1e-8
 
     # Outward orientation (shared helper; per-point + open-surface aware)
-    xyz_norm = eval_surface(map_model, uv_flat, batch_size=None, device=device)
+    xyz_norm = eval_surface(map_model, uv_flat, batch_size=None, chart_idx=chart_idx, device=device)
     normals_neural = _orient_outward(normals_neural, xyz_norm, norm_points, topology)
 
     xyz_voxel = (
@@ -267,6 +264,11 @@ def _project_surface_optimized(
             cval=0.0,
         )
         layers.append(layer.reshape(uv_res, uv_res))
+
+    if hull_mask is not None:
+        for i in range(len(layers)):
+            layers[i] = layers[i].astype(np.float32)
+            layers[i][~hull_mask] = np.nan
 
     # Raw XYZ map for downstream use
     xyz_map_voxel = (xyz_norm * points.std() + points.mean(axis=0)) * mesh_to_vol_scale
