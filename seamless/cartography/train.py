@@ -224,7 +224,9 @@ def train_nuvo(
     topology:   str = "cylinder",
     pe_degree:  int = 2,
     warm_iters: int = 300,
+    use_warm_start: bool = True,
     phase_b_ratio: float = 0.35,
+    lr: float = 3e-4,
     base_model: "NuvoMLP" = None,
     verbose:    bool = True,
 ) -> tuple["NuvoMLP", np.ndarray, np.ndarray]:
@@ -232,11 +234,11 @@ def train_nuvo(
     if verbose:
         _print_sep("Phase 5 – Nuvo Parameterisation")
         print(f"  num_charts={num_charts}  topology={topology}  pe_degree={pe_degree}")
-        print(f"  curriculum: Phase A (warm-up) → Phase B (geometry) → Phase C (full Nuvo)\n")
+        warm_label = "Phase A (warm-up) → " if (base_model is None and use_warm_start) else ""
+        print(f"  curriculum: {warm_label}Phase B (geometry) → Phase C (full Nuvo)\n")
 
     set_seed(SEED)
-    
-    # Initialize the model first
+
     if base_model is None:
         map_model = NuvoMLP(
             num_charts=num_charts, hidden_dim=128, num_layers=5,
@@ -248,12 +250,14 @@ def train_nuvo(
         map_model = base_model
 
     # ── Phase A: Warm-start ──
-    if base_model is None:
+    if base_model is None and use_warm_start:
         _warm_start(map_model, pts_fixed, topology, device, warm_iters=warm_iters, verbose=verbose)
+    elif base_model is None and not use_warm_start and verbose:
+        print("  [warm-start] Skipped (use_warm_start=False).\n")
         
     sigma     = nn.Parameter(torch.tensor(1.0, device=device))
     map_opt   = torch.optim.Adam(
-        list(map_model.parameters()) + [sigma], lr=MAP_LR
+        list(map_model.parameters()) + [sigma], lr=lr
     )
 
     # ── Phase B / C: Curriculum main loop ──

@@ -132,9 +132,9 @@ plots/
 # Jupyter notebooks & checkpoints
 # ---------------------------------------------------------------------------
 .ipynb_checkpoints/
-# Allow example notebooks before excluding all other notebooks
-!examples/*.ipynb
 *.ipynb
+# Allow example notebooks (must come after the blanket rule)
+!examples/*.ipynb
 
 # ---------------------------------------------------------------------------
 # Environment / secrets
@@ -165,3 +165,6 @@ docs/
 deprecated/
 notebooks/
 # Note: examples/ is selectively included above (notebooks + synthetic data)
+
+# Private Claude context — synced manually (e.g. rsync) between machines, never committed
+CLAUDE.local.md

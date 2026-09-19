@@ -1,12 +1,13 @@
 import io
 from pathlib import Path
+from typing import Optional
 import h5py
 import torch
 from seamless.flow.networks import FlowMLP
 from seamless.cartography.networks import NuvoMLP
 import numpy as np
 
-def load_timepoint_data(results_h5: Path, t: int, device: torch.device, pe_degree: int = 0) -> tuple[FlowMLP | None, torch.Tensor, torch.Tensor, dict]:
+def load_timepoint_data(results_h5: Path, t: int, device: torch.device, pe_degree: int = 0) -> "tuple[Optional[FlowMLP], torch.Tensor, torch.Tensor, dict]":
     """Load model, flow velocity, and surface points for a specific timepoint.
 
     Args:
@@ -46,7 +47,7 @@ def load_timepoint_data(results_h5: Path, t: int, device: torch.device, pe_degre
                 
     return model, flow, xyz, kinematics
 
-def load_nuvo(grp: h5py.Group, device: torch.device, t_pe_degree: int = 2, s_pe_degree: int = 2) -> NuvoMLP | None:
+def load_nuvo(grp: h5py.Group, device: torch.device, t_pe_degree: int = 2, s_pe_degree: int = 2) -> Optional[NuvoMLP]:
     """Load NuvoMLP model from HDF5 group.
 
     Args:
@@ -88,7 +89,7 @@ def load_projections_complete(projection_file: Path, device: torch.device):
         xyz_maps_norm:   dict[int, np.ndarray] = {}
         pts_std_all:     dict[int, float] = {}
         pts_mean_all:    dict[int, np.ndarray] = {}
-        nuvo_models:     dict[int, NuvoMLP | None] = {}
+        nuvo_models:     dict = {}
 
         for k in timekeys:
             t_idx = int(k[1:])
