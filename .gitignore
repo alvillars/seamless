@@ -166,5 +166,6 @@ docs/
 deprecated/
 notebooks/
 CLAUDE.local.md
+HANDOFF.md
 # Note: examples/ is selectively included above (notebooks + synthetic data)
 CLAUDE.md

@@ -374,6 +374,12 @@ class Parameterizer:
         use_warm_start: Optional[bool] = None,
         phase_b_ratio: float = 0.0,
         lr: Optional[float] = None,
+        sigma_lr: Optional[float] = None,
+        hidden_dim: Optional[int] = None,
+        num_layers: Optional[int] = None,
+        chart_layout: str = "wedge",
+        pole_fraction: float = 0.15,
+        pole_profile: str = "equidistant",
         verbose: bool = False,
     ) -> NuvoMLP:
         """Train the NuvoMLP parameterization.
@@ -392,12 +398,38 @@ class Parameterizer:
                 curriculum. Defaults to ``config.use_warm_start`` (True).
             phase_b_ratio: Fraction of iterations spent in geometry-only Phase B.
                 Defaults to 0.0 to match the legacy projection pipeline.
-            lr: Adam learning rate for the main training loop. Defaults to
-                ``config.lr`` (3e-4).
+            lr: Adam learning rate for the MLP parameters. Defaults to
+                ``config.lr`` (1e-4, matching the NUVO paper).
+            sigma_lr: Adam learning rate for the stretch-loss target area
+                ``sigma``. Defaults to ``config.sigma_lr`` (0.1, matching the
+                NUVO paper — sigma needs to adapt much faster than the MLPs).
+            hidden_dim: Hidden layer width for the NuvoMLP sub-networks.
+                Defaults to ``config.hidden_dim`` (256, matching the NUVO
+                paper). Only used when ``base_model`` is None — a warm-started
+                fine-tune reuses the base model's existing architecture.
+            num_layers: Layers per NuvoMLP sub-network. Defaults to
+                ``config.num_layers`` (8, matching the NUVO paper). Only used
+                when ``base_model`` is None, for the same reason.
+            chart_layout: Analytic warm-start chart seed — "wedge" (default,
+                num_charts equal-width azimuthal wedges) or "pole_pole_band"
+                (2 polar caps + 1 equatorial band, requires num_charts=3).
+                Only used when warm-starting from scratch (``base_model`` is
+                None and ``use_warm_start`` is True).
+            pole_fraction: Pole-cap size (quantile of polar angle) for
+                ``chart_layout="pole_pole_band"``. Ignored otherwise.
+            pole_profile: Pole radial-distortion profile — "equidistant",
+                "equal_area", or "conformal" — for
+                ``chart_layout="pole_pole_band"``. Ignored otherwise.
             verbose: Forward training logs.
 
         Returns:
             The trained NuvoMLP.
+
+        Note:
+            Changing ``hidden_dim``/``num_layers`` from the values used to
+            train a previously saved model changes its parameter shapes —
+            any checkpoint loaded via ``base_model=`` or ``load_nuvo`` must
+            have been trained with matching values.
         """
         if iterations is None:
             iterations = (
@@ -407,6 +439,12 @@ class Parameterizer:
             )
         if lr is None:
             lr = self.config.lr
+        if sigma_lr is None:
+            sigma_lr = self.config.sigma_lr
+        if hidden_dim is None:
+            hidden_dim = self.config.hidden_dim
+        if num_layers is None:
+            num_layers = self.config.num_layers
         if use_warm_start is None:
             use_warm_start = self.config.use_warm_start
 
@@ -422,6 +460,12 @@ class Parameterizer:
             use_warm_start=use_warm_start,
             phase_b_ratio=phase_b_ratio,
             lr=lr,
+            sigma_lr=sigma_lr,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            chart_layout=chart_layout,
+            pole_fraction=pole_fraction,
+            pole_profile=pole_profile,
             base_model=base_model,
             verbose=verbose,
         )

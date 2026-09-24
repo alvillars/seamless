@@ -70,13 +70,14 @@ class KinematicsConfig:
 class ParameterizationConfig:
     """Configuration for NuvoMLP parameterization training."""
     num_charts: int = 1              # number of charts (default: 1)
-    hidden_dim: int = 128            # hidden dimension
-    num_layers: int = 5              # number of layers
+    hidden_dim: int = 256            # hidden dimension (NUVO paper value)
+    num_layers: int = 8              # number of layers (NUVO paper value)
     t_pe_degree: int = 2             # positional encoding degree for texture coords
     s_pe_degree: int = 2             # positional encoding degree for surface coords
     iterations_t0: int = 300         # iterations at t=0
     iterations_warm_start: int = 50  # iterations for warm-start (t>0)
-    lr: float = 3e-4                 # Adam learning rate for the main training loop
+    lr: float = 1e-4                 # Adam learning rate for MLP params (NUVO paper value)
+    sigma_lr: float = 0.1            # Adam learning rate for the stretch-loss target area sigma
     use_warm_start: bool = True      # run analytical-UV Phase A before curriculum
 
 
