@@ -47,7 +47,10 @@ def load_timepoint_data(results_h5: Path, t: int, device: torch.device, pe_degre
                 
     return model, flow, xyz, kinematics
 
-def load_nuvo(grp: h5py.Group, device: torch.device, t_pe_degree: int = 2, s_pe_degree: int = 2) -> Optional[NuvoMLP]:
+def load_nuvo(
+    grp: h5py.Group, device: torch.device, t_pe_degree: int = 2, s_pe_degree: int = 2,
+    hidden_dim: int = 256, num_layers: int = 8,
+) -> Optional[NuvoMLP]:
     """Load NuvoMLP model from HDF5 group.
 
     Args:
@@ -55,6 +58,10 @@ def load_nuvo(grp: h5py.Group, device: torch.device, t_pe_degree: int = 2, s_pe_
         device: Torch device for loading
         t_pe_degree: Positional encoding degree for texture coordinates (default: 2)
         s_pe_degree: Positional encoding degree for surface coordinates (default: 2)
+        hidden_dim: Hidden layer width (default: 256, matching ParameterizationConfig).
+            Must match the value used to train the saved model.
+        num_layers: Layers per sub-network (default: 8, matching ParameterizationConfig).
+            Must match the value used to train the saved model.
 
     Returns:
         NuvoMLP model or None if model_state_dict not in group
@@ -63,7 +70,7 @@ def load_nuvo(grp: h5py.Group, device: torch.device, t_pe_degree: int = 2, s_pe_
         return None
     raw = grp["model_state_dict"][:].tobytes()
     state = torch.load(io.BytesIO(raw), map_location=device, weights_only=True)
-    model = NuvoMLP(num_charts=1, hidden_dim=128, num_layers=5,
+    model = NuvoMLP(num_charts=1, hidden_dim=hidden_dim, num_layers=num_layers,
                     t_pe_degree=t_pe_degree, s_pe_degree=s_pe_degree).to(device)
     model.load_state_dict(state)
     model.eval()

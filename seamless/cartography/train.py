@@ -51,9 +51,9 @@ N_POINTS    = 2000
 TTO_ITERS   = 300
 HHD_EPOCHS  = 200
 MAP_ITERS   = 500
-MAP_LR      = 3e-4
-W_323       = 1.0
-W_232       = 1.0
+MAP_LR      = 1e-4
+W_323       = 11.0
+W_232       = 11.0
 W_ENTROPY   = 0.04
 W_SURFACE   = 10.0
 W_CLUSTER   = 0.5
@@ -145,6 +145,105 @@ def _analytical_uv(pts: torch.Tensor, topology: str) -> torch.Tensor:
     return torch.stack([u, v], dim=1)   # (N, 2)  all values in [0, 1]
 
 
+def _wedge_chart_seed(pts: torch.Tensor, topology: str, num_charts: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Default chart seed: `num_charts` equal-width azimuthal wedges of `_analytical_uv`.
+
+    Returns (uv_local, chart_labels) — uv_local is already rescaled into each
+    chart's own [0,1)^2 frame. num_charts=2 reduces to the original left/right
+    split; num_charts=1 assigns everything to chart 0.
+    """
+    target_uv = _analytical_uv(pts, topology)                     # (N, 2) in [0,1]
+    if num_charts >= 2:
+        chart_labels = (target_uv[:, 0] * num_charts).long().clamp(max=num_charts - 1)
+    else:
+        chart_labels = torch.zeros(pts.shape[0], dtype=torch.long, device=pts.device)
+
+    uv_local = target_uv.clone()
+    if num_charts >= 2:
+        uv_local[:, 0] = uv_local[:, 0] * num_charts - chart_labels.to(uv_local.dtype)  # [c/K,(c+1)/K)->[0,1)
+    return uv_local, chart_labels
+
+
+def _pole_pole_band_seed(
+    pts: torch.Tensor, pole_fraction: float = 0.15, pole_profile: str = "equidistant",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """3-chart analytic seed for closed, roughly ellipsoidal surfaces: two polar-cap
+    charts + one equatorial-band chart (mirrors how tools like Blender tissue
+    cartography seam an ellipsoid — 2 poles + a cylindrical middle).
+
+    Chart 0 = band (cylindrical unwrap, same u/v convention as topology="cylinder").
+    Chart 1 = north pole, chart 2 = south pole — each an azimuthal projection onto
+    a disk inscribed in that chart's unit square (corners fall outside the disk;
+    that's the same "outside UV support" case `uv_convex_hull_mask` already masks
+    at projection time, so no new machinery is needed for it).
+
+    Requires exactly 3 charts — the geometry is fixed (1 band + 2 poles), it does
+    not generalize to an arbitrary `num_charts` the way the wedge seed does.
+
+    Args:
+        pole_fraction: Size of each pole cap, as a quantile of the point cloud's
+            own polar-angle distribution (not a fixed angle) so it adapts to the
+            object's actual shape/density instead of assuming a perfect sphere.
+        pole_profile: Radial distortion character of the pole charts, the same
+            three-way choice classical polar-aspect map projections make:
+            "equidistant" (rho = theta/theta_p, default, undistorted radially),
+            "equal_area" (rho = sin(theta)/sin(theta_p), Lambert azimuthal),
+            "conformal" (rho = tan(theta/2)/tan(theta_p/2), stereographic).
+
+    Returns:
+        (uv_local, chart_labels) — uv_local already rescaled into each chart's
+        own [0,1]^2 frame, chart_labels in {0, 1, 2}.
+    """
+    pts_np   = pts.detach().cpu().numpy()
+    pts_c_np = pts_np - pts_np.mean(axis=0)
+    _, _, Vt = np.linalg.svd(pts_c_np, full_matrices=False)
+    pc1 = torch.tensor(Vt[0], dtype=pts.dtype, device=pts.device)   # polar axis (longest)
+    pc2 = torch.tensor(Vt[1], dtype=pts.dtype, device=pts.device)
+    pc3 = torch.tensor(Vt[2], dtype=pts.dtype, device=pts.device)
+
+    pts_c = pts - pts.mean(dim=0)
+    zp = pts_c @ pc1
+    xp = pts_c @ pc2
+    yp = pts_c @ pc3
+    r     = torch.sqrt(xp**2 + yp**2 + zp**2).clamp(min=1e-8)
+    theta = torch.acos((zp / r).clamp(-1 + 1e-6, 1 - 1e-6))         # [0, pi], 0 = north pole
+    az    = torch.atan2(yp, xp)
+
+    theta_p = torch.quantile(theta, pole_fraction).clamp(min=1e-3, max=math.pi / 2 - 1e-3)
+    north_mask = theta < theta_p
+    south_mask = theta > (math.pi - theta_p)
+    band_mask  = ~north_mask & ~south_mask
+
+    chart_labels = torch.zeros(pts.shape[0], dtype=torch.long, device=pts.device)
+    chart_labels[north_mask] = 1
+    chart_labels[south_mask] = 2
+
+    uv_local = torch.zeros(pts.shape[0], 2, dtype=pts.dtype, device=pts.device)
+
+    # Band -> chart 0: cylindrical unwrap, same convention as topology="cylinder".
+    u_az = (az / (2.0 * math.pi)) % 1.0
+    uv_local[band_mask, 0] = u_az[band_mask]
+    uv_local[band_mask, 1] = (theta[band_mask] - theta_p) / (math.pi - 2 * theta_p)
+
+    def _radial(theta_from_pole: torch.Tensor) -> torch.Tensor:
+        if pole_profile == "equal_area":
+            return torch.sin(theta_from_pole) / torch.sin(theta_p)
+        if pole_profile == "conformal":
+            return torch.tan(theta_from_pole / 2) / torch.tan(theta_p / 2)
+        return theta_from_pole / theta_p   # "equidistant"
+
+    # Poles -> charts 1/2: azimuthal disk inscribed in [0,1]^2.
+    rho_n = _radial(theta[north_mask])
+    uv_local[north_mask, 0] = 0.5 + 0.5 * rho_n * torch.cos(az[north_mask])
+    uv_local[north_mask, 1] = 0.5 + 0.5 * rho_n * torch.sin(az[north_mask])
+
+    rho_s = _radial(math.pi - theta[south_mask])
+    uv_local[south_mask, 0] = 0.5 + 0.5 * rho_s * torch.cos(az[south_mask])
+    uv_local[south_mask, 1] = 0.5 + 0.5 * rho_s * torch.sin(az[south_mask])
+
+    return uv_local, chart_labels
+
+
 def _warm_start(
     model:      "NuvoMLP",
     pts:        torch.Tensor,
@@ -152,51 +251,62 @@ def _warm_start(
     device:     torch.device,
     warm_iters: int = 300,
     verbose:    bool = True,
+    chart_layout:  str = "wedge",
+    pole_fraction: float = 0.15,
+    pole_profile:  str = "equidistant",
 ) -> None:
     """Universal analytical-UV warm-start with supervised chart assignment.
 
     Pre-trains:
-    1. ChartAssignmentMLP: Force a split along the longest axis (u=0.5).
+    1. ChartAssignmentMLP: assign each point a chart per `chart_layout`.
     2. TextureCoordinateMLP: Map 3D -> UV per chart (rescaled to [0,1]).
     3. SurfaceCoordinateMLP: Map UV -> 3D per chart (inverse).
-    """
-    if verbose:
-        print(f"  [warm-start] Pre-training on supervised {model.num_charts}-chart {topology} UV …")
-    target_uv = _analytical_uv(pts, topology).to(device)         # (N, 2) in [0,1]
-    warm_opt  = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # 1. Define Chart Labels based on the analytical U (longest-axis azimuth)
-    if model.num_charts >= 2:
-        chart_labels = (target_uv[:, 0] >= 0.5).long()           # left / right halves
+    `chart_layout` selects the analytic seed:
+      - "wedge" (default): `num_charts` equal-width azimuthal wedges (`_wedge_chart_seed`).
+        Generalizes to any `num_charts >= 1` — num_charts=2 reduces exactly to the
+        original left/right split. Previously this hardcoded a binary {0,1} split
+        and a `range(min(num_charts, 2))` reconstruction loop, silently leaving
+        chart indices >= 2 unsupervised (random-init) for num_charts >= 3.
+      - "pole_pole_band": 2 polar caps + 1 equatorial band (`_pole_pole_band_seed`),
+        requires num_charts=3.
+    """
+    num_charts = model.num_charts
+    if verbose:
+        print(f"  [warm-start] Pre-training on supervised {num_charts}-chart "
+              f"{topology} UV (chart_layout={chart_layout!r}) …")
+    warm_opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    if chart_layout == "pole_pole_band":
+        if num_charts != 3:
+            raise ValueError(
+                f"chart_layout='pole_pole_band' requires num_charts=3, got {num_charts}"
+            )
+        uv_local, chart_labels = _pole_pole_band_seed(
+            pts, pole_fraction=pole_fraction, pole_profile=pole_profile)
     else:
-        chart_labels = torch.zeros(pts.shape[0], dtype=torch.long, device=device)
+        uv_local, chart_labels = _wedge_chart_seed(pts, topology, num_charts)
+    uv_local, chart_labels = uv_local.to(device), chart_labels.to(device)
 
     for i in range(warm_iters):
         warm_opt.zero_grad()
-        
+
         total_loss = pts.new_zeros(1)
 
         # --- A. Supervise Chart Assignment (Multi-chart only) ---
-        if model.num_charts >= 2:
+        if num_charts >= 2:
             pred_probs = model.chart_assignment_mlp(pts)
             loss_assign = torch.nn.functional.cross_entropy(pred_probs, chart_labels)
             total_loss = total_loss + loss_assign
-        
-        for c in range(min(model.num_charts, 2)):
+
+        for c in range(num_charts):
             mask = (chart_labels == c)
             if mask.sum() < 2:
                 continue
-            
+
             pts_c = pts[mask]
-            uv_c  = target_uv[mask].clone()
-            
-            # --- B. Rescale UV to local chart [0, 1] ---
-            if model.num_charts >= 2:
-                if c == 0:
-                    uv_c[:, 0] = uv_c[:, 0] * 2.0         # [0, 0.5] -> [0, 1]
-                else:
-                    uv_c[:, 0] = (uv_c[:, 0] - 0.5) * 2.0 # [0.5, 1] -> [0, 1]
-            
+            uv_c  = uv_local[mask]
+
             # 3D → UV : forward supervision
             pred_uv  = model.texture_coordinate_mlp(pts_c, c)
             total_loss = total_loss + torch.nn.functional.mse_loss(pred_uv, uv_c)
@@ -226,7 +336,13 @@ def train_nuvo(
     warm_iters: int = 300,
     use_warm_start: bool = True,
     phase_b_ratio: float = 0.35,
-    lr: float = 3e-4,
+    lr: float = 1e-4,
+    sigma_lr: float = 0.1,
+    hidden_dim: int = 256,
+    num_layers: int = 8,
+    chart_layout:  str = "wedge",
+    pole_fraction: float = 0.15,
+    pole_profile:  str = "equidistant",
     base_model: "NuvoMLP" = None,
     verbose:    bool = True,
 ) -> tuple["NuvoMLP", np.ndarray, np.ndarray]:
@@ -241,7 +357,7 @@ def train_nuvo(
 
     if base_model is None:
         map_model = NuvoMLP(
-            num_charts=num_charts, hidden_dim=128, num_layers=5,
+            num_charts=num_charts, hidden_dim=hidden_dim, num_layers=num_layers,
             t_pe_degree=pe_degree, s_pe_degree=pe_degree,
         ).to(device)
     else:
@@ -251,16 +367,32 @@ def train_nuvo(
 
     # ── Phase A: Warm-start ──
     if base_model is None and use_warm_start:
-        _warm_start(map_model, pts_fixed, topology, device, warm_iters=warm_iters, verbose=verbose)
+        _warm_start(map_model, pts_fixed, topology, device, warm_iters=warm_iters, verbose=verbose,
+                    chart_layout=chart_layout, pole_fraction=pole_fraction, pole_profile=pole_profile)
     elif base_model is None and not use_warm_start and verbose:
         print("  [warm-start] Skipped (use_warm_start=False).\n")
         
     sigma     = nn.Parameter(torch.tensor(1.0, device=device))
-    map_opt   = torch.optim.Adam(
-        list(map_model.parameters()) + [sigma], lr=lr
+    map_opt   = torch.optim.Adam([
+        {"params": map_model.parameters(), "lr": lr},
+        {"params": [sigma],                "lr": sigma_lr},
+    ])
+
+    # "Paper mode": training completely from scratch, no analytical warm-start
+    # at all (the NUVO paper never warm-starts — our _analytical_uv shortcut only
+    # exists because cylinder/sphere/bent_sheet happen to admit a closed form; it
+    # won't generalize to arbitrary biological topologies). The paper also reports
+    # no phased/curriculum loss schedule, only "Adam ... with a cosine decay
+    # schedule" — so paper mode skips the Phase B/C ramp entirely (full loss
+    # weights from iteration 0) and decays both param groups' LR to 0 over
+    # n_iters, instead of the curriculum used for the warm-started recipe below.
+    paper_mode = base_model is None and not use_warm_start
+    lr_scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(map_opt, T_max=n_iters)
+        if paper_mode else None
     )
 
-    # ── Phase B / C: Curriculum main loop ──
+    # ── Phase B / C: Curriculum main loop (warm-started recipe only) ──
     phase_b_end = int(phase_b_ratio * n_iters)   # pure geometry losses
     phase_c_end = n_iters                        # full 7-term Nuvo
 
@@ -270,6 +402,9 @@ def train_nuvo(
     )
     log_every = max(1, n_iters // 10)
     if verbose:
+        if paper_mode:
+            print("  [paper-mode] no curriculum ramp, cosine LR decay over "
+                  f"{n_iters} iterations\n")
         print(header)
         _print_sep()
 
@@ -278,8 +413,13 @@ def train_nuvo(
         uvs = torch.rand(N_POINTS, 2, device=device)
         map_opt.zero_grad()
 
+        if paper_mode:
+            # Full loss weights from iteration 0 -- no ramp, matching the paper.
+            phase = "P"
+            w323, w232, w_surf = W_323, W_232, W_SURFACE
+            w_conf, w_strch, w_clust, w_ent = W_CONFORMAL, W_STRETCH, W_CLUSTER, W_ENTROPY
         # Loss weight schedule — ramp in cycle+surface losses gradually
-        if i < phase_b_end:
+        elif i < phase_b_end:
             phase = "B"
             w323, w232, w_surf = 0.0, 0.0, 0.0
             w_conf, w_strch, w_clust, w_ent = W_CONFORMAL, W_STRETCH, W_CLUSTER, 0.0
@@ -299,6 +439,8 @@ def train_nuvo(
         )
         total.backward()
         map_opt.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
         if verbose and (i + 1) % log_every == 0:
             print(
